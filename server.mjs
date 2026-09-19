@@ -1,7 +1,9 @@
 import { createServer } from "node:http";
+import fs from "node:fs";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
+import { publish, uploadImage } from "./scripts/lib.mjs";
 
 const PORT = Number(process.env.PORT || 3000);
 const BINANCE_URL =
@@ -9,17 +11,9 @@ const BINANCE_URL =
 
 async function publishTextToBinance(text) {
   const apiKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
-  if (!apiKey) {
-    throw new Error("BINANCE_SQUARE_OPENAPI_KEY is not configured on the server.");
-  }
-
-  if (typeof text !== "string" || !text.trim()) {
-    throw new Error("Post text is empty.");
-  }
-
-  if (text.length > 2100) {
-    throw new Error(`Post text is too long: ${text.length}/2100 characters.`);
-  }
+  if (!apiKey) throw new Error("BINANCE_SQUARE_OPENAPI_KEY is not configured on the server.");
+  if (typeof text !== "string" || !text.trim()) throw new Error("Post text is empty.");
+  if (text.length > 2100) throw new Error(`Post text is too long: ${text.length}/2100 characters.`);
 
   const response = await fetch(BINANCE_URL, {
     method: "POST",
@@ -33,73 +27,68 @@ async function publishTextToBinance(text) {
 
   const raw = await response.text();
   let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    payload = null;
-  }
-
-  if (!response.ok) {
-    throw new Error(`Binance Square returned HTTP ${response.status}. ${raw.slice(0, 500)}`);
-  }
-
+  try { payload = JSON.parse(raw); } catch { payload = null; }
+  if (!response.ok) throw new Error(`Binance Square returned HTTP ${response.status}. ${raw.slice(0, 500)}`);
   if (!payload || payload.code !== "000000") {
     const code = payload?.code ?? "unknown";
     const message = payload?.message ?? "Unknown Binance Square error";
     throw new Error(`Binance Square publish failed. code=${code}, message=${message}`);
   }
-
   const id = payload?.data?.id;
-  if (!id) {
-    throw new Error("Binance Square reported success, but no post ID was returned.");
-  }
+  if (!id) throw new Error("Binance Square reported success, but no post ID was returned.");
+  return { id: String(id), url: `https://www.binance.com/square/post/${id}` };
+}
 
-  return {
-    id: String(id),
-    url: `https://www.binance.com/square/post/${id}`,
-  };
+async function publishImageFromEnvironment(text) {
+  const apiKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
+  if (!apiKey) throw new Error("BINANCE_SQUARE_OPENAPI_KEY is not configured on the server.");
+
+  const chunks = Object.keys(process.env)
+    .filter((k) => /^CHAOSHENG_IMAGE_B64_\d+$/.test(k))
+    .sort()
+    .map((k) => process.env[k] || "");
+
+  if (!chunks.length) throw new Error("No image payload chunks were provided.");
+
+  const imageBuffer = Buffer.from(chunks.join(""), "base64");
+  if (!imageBuffer.length) throw new Error("Decoded image payload is empty.");
+
+  const imgPath = "/tmp/chaosheng-square-post.jpg";
+  fs.writeFileSync(imgPath, imageBuffer);
+
+  const imageUrl = await uploadImage(apiKey, imgPath);
+  const result = await publish(apiKey, {
+    contentType: 1,
+    bodyTextOnly: text,
+    imageList: [imageUrl],
+  });
+
+  const id = result?.id ?? null;
+  const url = result?.shareLink || (id ? `https://www.binance.com/square/post/${id}` : null);
+  return { id, url };
 }
 
 function makeMcpServer() {
   const server = new McpServer({
     name: "chaosheng-binance-square-publisher",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   server.registerTool(
     "publish_binance_square_post",
     {
       description:
-        "Publish the exact finalized text to Binance Square. This is an external write action. Call only after the user explicitly asks to publish the post.",
+        "Publish the exact finalized text to Binance Square. Call only after the user explicitly asks to publish.",
       inputSchema: z.object({
-        text: z
-          .string()
-          .min(1)
-          .max(2100)
-          .describe("The exact Binance Square post text to publish."),
+        text: z.string().min(1).max(2100),
       }),
     },
     async ({ text }) => {
       try {
         const result = await publishTextToBinance(text);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Published successfully. Post ID: ${result.id}\n${result.url}`,
-            },
-          ],
-        };
+        return { content: [{ type: "text", text: `Published successfully. Post ID: ${result.id}\n${result.url}` }] };
       } catch (error) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: error instanceof Error ? error.message : String(error),
-            },
-          ],
-        };
+        return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }] };
       }
     }
   );
@@ -116,14 +105,12 @@ const httpServer = createServer((req, res) => {
 
   if (req.method === "GET" && url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(
-      JSON.stringify({
-        ok: true,
-        service: "chaosheng-binance-square-publisher",
-        mcpConfigured: Boolean(process.env.MCP_PATH_SECRET),
-        binanceConfigured: Boolean(process.env.BINANCE_SQUARE_OPENAPI_KEY),
-      })
-    );
+    res.end(JSON.stringify({
+      ok: true,
+      service: "chaosheng-binance-square-publisher",
+      mcpConfigured: Boolean(process.env.MCP_PATH_SECRET),
+      binanceConfigured: Boolean(process.env.BINANCE_SQUARE_OPENAPI_KEY),
+    }));
     return;
   }
 
@@ -155,18 +142,22 @@ async function maybePublishFromEnvironment() {
 
   const text = process.env.CHAOSHENG_PUBLISH_TEXT;
   const nonce = process.env.CHAOSHENG_PUBLISH_NONCE;
+  const mode = process.env.CHAOSHENG_PUBLISH_MODE || "text";
 
   if (!text || !nonce) {
     console.log("CHAOSHENG_PUBLISH_IDLE");
     return;
   }
 
-  console.log(`CHAOSHENG_PUBLISH_START nonce=${nonce}`);
+  console.log(`CHAOSHENG_PUBLISH_START nonce=${nonce} mode=${mode}`);
 
   try {
-    const result = await publishTextToBinance(text);
+    const result = mode === "image"
+      ? await publishImageFromEnvironment(text)
+      : await publishTextToBinance(text);
+
     console.log(
-      `CHAOSHENG_PUBLISH_SUCCESS nonce=${nonce} postId=${result.id} url=${result.url}`
+      `CHAOSHENG_PUBLISH_SUCCESS nonce=${nonce} postId=${result.id ?? "unavailable"} url=${result.url ?? "unavailable"}`
     );
   } catch (error) {
     console.error(

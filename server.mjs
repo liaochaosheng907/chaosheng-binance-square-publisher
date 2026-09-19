@@ -7,10 +7,63 @@ const PORT = Number(process.env.PORT || 3000);
 const BINANCE_URL =
   "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add";
 
+async function publishTextToBinance(text) {
+  const apiKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
+  if (!apiKey) {
+    throw new Error("BINANCE_SQUARE_OPENAPI_KEY is not configured on the server.");
+  }
+
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error("Post text is empty.");
+  }
+
+  if (text.length > 2100) {
+    throw new Error(`Post text is too long: ${text.length}/2100 characters.`);
+  }
+
+  const response = await fetch(BINANCE_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "clienttype": "binanceSkill",
+      "X-Square-OpenAPI-Key": apiKey,
+    },
+    body: JSON.stringify({ bodyTextOnly: text }),
+  });
+
+  const raw = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    throw new Error(`Binance Square returned HTTP ${response.status}. ${raw.slice(0, 500)}`);
+  }
+
+  if (!payload || payload.code !== "000000") {
+    const code = payload?.code ?? "unknown";
+    const message = payload?.message ?? "Unknown Binance Square error";
+    throw new Error(`Binance Square publish failed. code=${code}, message=${message}`);
+  }
+
+  const id = payload?.data?.id;
+  if (!id) {
+    throw new Error("Binance Square reported success, but no post ID was returned.");
+  }
+
+  return {
+    id: String(id),
+    url: `https://www.binance.com/square/post/${id}`,
+  };
+}
+
 function makeMcpServer() {
   const server = new McpServer({
     name: "chaosheng-binance-square-publisher",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.registerTool(
@@ -27,97 +80,27 @@ function makeMcpServer() {
       }),
     },
     async ({ text }) => {
-      const apiKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
-      if (!apiKey) {
+      try {
+        const result = await publishTextToBinance(text);
         return {
-          isError: true,
           content: [
             {
               type: "text",
-              text: "BINANCE_SQUARE_OPENAPI_KEY is not configured on the server.",
+              text: `Published successfully. Post ID: ${result.id}\n${result.url}`,
             },
           ],
         };
-      }
-
-      let response;
-      try {
-        response = await fetch(BINANCE_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "clienttype": "binanceSkill",
-            "X-Square-OpenAPI-Key": apiKey,
-          },
-          body: JSON.stringify({ bodyTextOnly: text }),
-        });
       } catch (error) {
         return {
           isError: true,
           content: [
             {
               type: "text",
-              text: `Network error while publishing to Binance Square: ${error instanceof Error ? error.message : String(error)}`,
+              text: error instanceof Error ? error.message : String(error),
             },
           ],
         };
       }
-
-      const raw = await response.text();
-      let payload;
-      try {
-        payload = JSON.parse(raw);
-      } catch {
-        payload = null;
-      }
-
-      if (!response.ok) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Binance Square returned HTTP ${response.status}. ${raw.slice(0, 500)}`,
-            },
-          ],
-        };
-      }
-
-      if (!payload || payload.code !== "000000") {
-        const code = payload?.code ?? "unknown";
-        const message = payload?.message ?? "Unknown Binance Square error";
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Binance Square publish failed. code=${code}, message=${message}`,
-            },
-          ],
-        };
-      }
-
-      const id = payload?.data?.id;
-      if (!id) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Binance Square reported success, but no post ID was returned. Check your Square profile.",
-            },
-          ],
-        };
-      }
-
-      const url = `https://www.binance.com/square/post/${id}`;
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Published successfully. Post ID: ${id}\n${url}`,
-          },
-        ],
-      };
     }
   );
 
@@ -164,6 +147,35 @@ const httpServer = createServer((req, res) => {
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`chaosheng publisher listening on port ${PORT}`);
 });
+
+let startupPublishStarted = false;
+async function maybePublishFromEnvironment() {
+  if (startupPublishStarted) return;
+  startupPublishStarted = true;
+
+  const text = process.env.CHAOSHENG_PUBLISH_TEXT;
+  const nonce = process.env.CHAOSHENG_PUBLISH_NONCE;
+
+  if (!text || !nonce) {
+    console.log("CHAOSHENG_PUBLISH_IDLE");
+    return;
+  }
+
+  console.log(`CHAOSHENG_PUBLISH_START nonce=${nonce}`);
+
+  try {
+    const result = await publishTextToBinance(text);
+    console.log(
+      `CHAOSHENG_PUBLISH_SUCCESS nonce=${nonce} postId=${result.id} url=${result.url}`
+    );
+  } catch (error) {
+    console.error(
+      `CHAOSHENG_PUBLISH_FAILED nonce=${nonce} error=${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+void maybePublishFromEnvironment();
 
 process.on("SIGTERM", async () => {
   await mcpHandler.close();

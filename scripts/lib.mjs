@@ -5,7 +5,7 @@ import path from "path";
 const BASE_URL_V1 = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi";
 const BASE_URL_V2 = "https://www.binance.com/bapi/composite/v2/public/pgc/openApi";
 const POLL_INTERVAL_MS = 3000;
-const MAX_POLL_RETRIES = 10;
+const MAX_POLL_RETRIES = 30;
 const CONFIG_DIR = path.join(os.homedir(), ".config", "binance-square");
 const CONFIG_FILE = path.join(CONFIG_DIR, "openapi-key");
 
